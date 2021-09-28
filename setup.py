@@ -20,7 +20,6 @@ setup(
     'certifi',
     'requests',
     'scipy',
-    'pycurl',
     'tqdm',
     'hatanaka'
   ],

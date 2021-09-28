@@ -8,5 +8,4 @@ pillow
 matplotlib
 cffi
 gmplot
-pycurl
 hatanaka

@@ -1,23 +1,25 @@
+from multiprocessing.pool import ThreadPool
+
 import certifi # type: ignore
 import ftplib
 import hatanaka
 import os
 import urllib.request
-import pycurl # type: ignore
 import re
+import requests
 import time
 import tempfile
 import socket
 
 from datetime import datetime
 from urllib.parse import urlparse
-from io import BytesIO
 
 from .constants import SECS_IN_HR, SECS_IN_DAY, SECS_IN_WEEK
 from .gps_time import GPSTime
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
 
+sess = requests.Session()
 
 def retryable(f):
   """
@@ -114,108 +116,44 @@ def http_download_files(url_base, folder_path, cacheDir, filenames):
   """
   folder_path_abs = os.path.join(cacheDir, folder_path)
 
-  def write_function(disk_path, handle):
-    def do_write(data):
-      open(disk_path, "wb").write(data)
-    return do_write
+  def do_download(task):
+    disk_path, url = task
+    if os.path.isfile(disk_path):
+      return disk_path
+    print("pulling from", url, "to", disk_path)
+    resp = sess.get(url, timeout=10, stream=True)
+    resp.raise_for_status()
+    tmp_path = disk_path + ".tmp"
+    with open(tmp_path, "wb") as outf:
+      for chunk in resp.iter_content(chunk_size=524288):
+        outf.write(chunk)
+    os.replace(tmp_path, disk_path)
+    return disk_path
 
-  fetcher = pycurl.CurlMulti()
-  fetcher.setopt(pycurl.M_PIPELINING, 3)
-  fetcher.setopt(pycurl.M_MAX_HOST_CONNECTIONS, 64)
-  fetcher.setopt(pycurl.M_MAX_TOTAL_CONNECTIONS, 64)
   filepaths = []
-  for filename in filenames:
-    # os.path.join will be dumb if filename has a leading /
-    # if there is a / in the filename, then it's using a different folder
-    filename = filename.lstrip("/")
-    if "/" in filename:
-      continue
-    filename_zipped = filename
-
-    filepath = os.path.join(folder_path_abs, filename)
-    filepath = str(hatanaka.get_decompressed_path(filepath))
-    filepath_zipped = os.path.join(folder_path_abs, filename_zipped)
-
-    if not os.path.isfile(filepath):
-      print("pulling from", url_base, "to", filepath)
-      if not os.path.exists(folder_path_abs):
-        os.makedirs(folder_path_abs)
-
-      url_path = url_base + folder_path + filename_zipped
-      handle = pycurl.Curl()
-      handle.setopt(pycurl.URL, url_path)
-      handle.setopt(pycurl.CONNECTTIMEOUT, 10)
-      handle.setopt(pycurl.WRITEFUNCTION, write_function(filepath_zipped, handle))
-      fetcher.add_handle(handle)
-      filepaths.append(filepath)
-
-  requests_processing = len(filepaths)
-  timeout = 10.0  # after 10 seconds of nothing happening, restart
-  deadline = time.time() + timeout
-  while requests_processing and time.time() < deadline:
-    while True:
-      ret, cur_requests_processing = fetcher.perform()
-      if ret != pycurl.E_CALL_MULTI_PERFORM:
-        _, success, failed = fetcher.info_read()
-        break
-    if requests_processing > cur_requests_processing:
-      deadline = time.time() + timeout
-      requests_processing = cur_requests_processing
-
-    if fetcher.select(1) < 0:
-      continue
-
-  # if there are downloads left to be done, repeat, and don't overwrite
-  _, requests_processing = fetcher.perform()
-  if requests_processing > 0:
-    print("some requests stalled, retrying them")
-    return http_download_files(url_base, folder_path, cacheDir, filenames)
+  with ThreadPool(8) as p:
+    tasks = []
+    for filename in filenames:
+      # os.path.join will be dumb if filename has a leading /
+      # if there is a / in the filename, then it's using a different folder
+      filename = filename.lstrip("/")
+      if "/" in filename:
+        continue
+      filepath_zipped = os.path.join(folder_path_abs, filename)
+      url_path = url_base + folder_path + filename
+      tasks.append((filepath_zipped, url_path))
+    for disk_path in p.imap_unordered(do_download, tasks):
+      filepaths.append(disk_path)
 
   return filepaths
 
 
 
 def https_download_file(url):
-  if 'nasa.gov/' not in url:
-    netrc_path = None
-    f = None
-  elif os.path.isfile(dir_path + '/.netrc'):
-    netrc_path = dir_path + '/.netrc'
-    f = None
-  else:
-    try:
-      username = os.environ['NASA_USERNAME']
-      password = os.environ['NASA_PASSWORD']
-      f = tempfile.NamedTemporaryFile()
-      netrc = f"machine urs.earthdata.nasa.gov login {username} password {password}"
-      f.write(netrc.encode())
-      f.flush()
-      netrc_path = f.name
-    except KeyError:
-      raise IOError('Could not find .netrc file and no NASA_USERNAME and NASA_PASSWORD in enviroment for urs.earthdata.nasa.gov authentication')
-
-  crl = pycurl.Curl()
-  crl.setopt(crl.CAINFO, certifi.where())
-  crl.setopt(crl.URL, url)
-  crl.setopt(crl.FOLLOWLOCATION, True)
-  crl.setopt(crl.SSL_CIPHER_LIST, 'DEFAULT@SECLEVEL=1')
-  crl.setopt(crl.COOKIEJAR, '/tmp/cddis_cookies')
-  crl.setopt(pycurl.CONNECTTIMEOUT, 10)
-  if netrc_path is not None:
-    crl.setopt(crl.NETRC_FILE, netrc_path)
-    crl.setopt(crl.NETRC, 2)
-
-  buf = BytesIO()
-  crl.setopt(crl.WRITEDATA, buf)
-  crl.perform()
-  response = crl.getinfo(pycurl.RESPONSE_CODE)
-  crl.close()
-  if f is not None:
-    f.close()
-
-  if response != 200:
-    raise IOError('HTTPS error ' + str(response))
-  return buf.getvalue()
+  # netrc is handled by requests
+  resp = sess.get(url, timeout=10)
+  resp.raise_for_status()
+  return resp.content
 
 
 def ftp_download_file(url):
@@ -242,13 +180,11 @@ def download_files(url_base, folder_path, cacheDir, filenames):
 def download_file(url_base, folder_path, filename_zipped):
   url = url_base + folder_path + filename_zipped
   print('Downloading ' + url)
-  if 'https' in url:
-    data_zipped = https_download_file(url)
-  elif 'ftp':
-    data_zipped = ftp_download_file(url)
-  else:
-    raise NotImplementedError('Did find ftp or https preamble')
-  return data_zipped
+  if url.startswith('https'):
+    return https_download_file(url)
+  if url.startswith('ftp'):
+    return ftp_download_file(url)
+  raise NotImplementedError('Did find ftp or https preamble')
 
 
 def download_and_cache_file(url_base, folder_path, cacheDir, filename, compression='', overwrite=False):
@@ -271,7 +207,7 @@ def download_and_cache_file(url_base, folder_path, cacheDir, filename, compressi
 
     try:
       data_zipped = download_file(url_base, folder_path, filename_zipped)
-    except (IOError, pycurl.error, socket.timeout):
+    except (IOError, socket.timeout):
       unix_time = time.time()
       if not os.path.exists(cacheDir + 'tmp/'):
         os.makedirs(cacheDir + '/tmp')
